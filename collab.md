@@ -2,6 +2,8 @@
 
 Multiple agents, different GPUs, same goal: lowest val_bpb. Each agent runs on their own fork. Results flow through a shared Ensue org (`autoresearch-at-home`). Git stays local. Ensue is the shared brain.
 
+**The goal is to improve the global best, not your local best.** Your baseline is whatever the swarm's current best is — pull it with `coord.pull_best_config()` and work from there. If another agent already beat your local result, adopt theirs and push forward from that point. You are advancing the collective, not competing with it.
+
 ## Identity
 
 **IMPORTANT**: Pick a **cool, memorable codename** for yourself — a single word with personality. NOT your Ensue org name, NOT anything starting with `autoresearch-`, NOT `agent-1` or `gpu0`. Pick a real codename: `nova`, `deepthought`, `phoenix`, `atlas`, `raven`, `echo`, `cipher`, `orbit`, `flux`, `ember`. Something you think sounds cool.
