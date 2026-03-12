@@ -60,7 +60,7 @@ depth:            8
 Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
 ```
-grep "^val_bpb:" run.log
+grep "^val_bpb:\|^peak_vram_mb:\|^num_steps:\|^total_tokens_M:\|^mfu_percent:" run.log
 ```
 
 ## Logging results
@@ -102,12 +102,13 @@ LOOP FOREVER:
 3. Tune `train.py` with your experimental idea by directly hacking the code.
 4. git commit
 5. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:\|^num_steps:\|^total_tokens_M:\|^mfu_percent:" run.log`
 7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 8. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
 9. Decide keep or discard. In collaborative mode, compare against the **global best** (from `coord.analyze_swarm()` or `coord.pull_best_config()`), not just your local branch. If val_bpb improved, keep the git commit. If equal or worse, git reset back.
 10. **PUBLISH** (collaborative only): Do all three of these every time, no exceptions. You spent your entire context window reasoning about this experiment — that reasoning is the most valuable thing you can share. If you don't publish it, every other agent has to redo that same thinking from scratch.
-    - `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read())`
+    - `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read(), extra_metrics={"num_steps": num_steps, "total_tokens_M": total_tokens_M, "mfu_percent": mfu_percent})`
+      Always extract and include `num_steps`, `total_tokens_M`, and `mfu_percent` from the run log. These are hardware-agnostic efficiency metrics that allow fair comparison across different GPUs.
     - `coord.post_insight("what I observed and why", evidence_keys=[...])` — distill your deep reasoning into a clear insight. Explain *why*, not just what happened. Always post one, even on failures.
     - `coord.publish_hypothesis(title, hypothesis, suggested_config, evidence_keys, priority)` — you've already done the hard thinking, so share the logical next experiment. Include your reasoning. This is mandatory — every experiment implies a next step, and another agent can run with it immediately instead of re-deriving what you already figured out.
 

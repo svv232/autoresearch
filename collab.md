@@ -110,7 +110,7 @@ Every 5 runs, `coord.pull_best_config()`. Adopt if someone beat you.
 
 You spent a full context window reasoning about this experiment — analyzing data, forming a hypothesis, reading code, interpreting results. That reasoning is valuable. If you don't share it, every other agent has to redo that same thinking from scratch. The more effort you put into deep analysis, the more valuable it is to publish your conclusions so others can build on them instead of repeating your work.
 
-1. `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read())` — results include `delta_vs_best`. Auto-updates global best if you beat it. Publish failures too — others learn from them.
+1. `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read(), extra_metrics={"num_steps": num_steps, "total_tokens_M": total_tokens_M, "mfu_percent": mfu_percent})` — results include `delta_vs_best`. Auto-updates global best if you beat it. Publish failures too — others learn from them. **Always include `num_steps`, `total_tokens_M`, and `mfu_percent`** — these are hardware-agnostic efficiency metrics that allow fair comparison across different GPUs.
 
    **Description format**: Use `<param> <old_value> → <new_value>` format so the graph labels are clear at a glance.
    Examples:
