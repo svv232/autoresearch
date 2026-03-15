@@ -7,6 +7,7 @@ Usage: uv run train.py
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"      # persistent compile cache across runs
 
 import gc
 import math
@@ -16,6 +17,13 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._inductor.config as inductor_config
+
+# B200 (Blackwell / SM100) torch.compile optimizations
+inductor_config.coordinate_descent_tuning = True       # fine-tune tile sizes per kernel
+inductor_config.max_autotune_gemm_backends = "CUTLASS,Triton,ATen"  # include CUTLASS SM100 kernels
+inductor_config.epilogue_fusion = True                 # fuse pointwise ops into matmul epilogues
+inductor_config.aggressive_fusion = True               # fuse more ops into fewer kernels
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -494,6 +502,8 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 # Model size
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+COMPILE_WARMUP_STEPS = 3 # extra warmup for max-autotune kernel benchmarking
+TIMING_WARMUP_STEPS = 10 + COMPILE_WARMUP_STEPS  # total steps before timing starts
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -607,7 +617,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+model = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -677,7 +687,7 @@ while True:
     t1 = time.time()
     dt = t1 - t0
 
-    if step > 10:
+    if step > TIMING_WARMUP_STEPS:
         total_training_time += dt
 
     # Logging
@@ -702,7 +712,7 @@ while True:
     step += 1
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > TIMING_WARMUP_STEPS and total_training_time >= TIME_BUDGET:
         break
 
 print()  # newline after \r training log
@@ -717,7 +727,7 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / GPU_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - TIMING_WARMUP_STEPS) / total_training_time / GPU_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
