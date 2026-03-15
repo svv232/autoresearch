@@ -7,6 +7,8 @@ Usage: uv run train.py
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"      # persistent compile cache across runs
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"         # serialize kernel launches for better overlap
 
 import gc
 import math
@@ -16,12 +18,50 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._inductor.config as inductor_config
+
+# B200 (Blackwell / SM100) torch.compile optimizations
+inductor_config.coordinate_descent_tuning = True       # fine-tune tile sizes per kernel
+inductor_config.max_autotune_gemm_backends = "CUTLASS,Triton,ATen"  # include CUTLASS SM100 kernels
+inductor_config.epilogue_fusion = True                 # fuse pointwise ops into matmul epilogues
+inductor_config.aggressive_fusion = True               # fuse more ops into fewer kernels
+inductor_config.shape_padding = True                   # pad matrices to tensor core tile boundaries
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+
+USE_FLEX_ATTENTION = cap[0] >= 10  # Blackwell (SM100) and future architectures
+
+if USE_FLEX_ATTENTION:
+    from functools import partial
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    _flex_attention_compiled = torch.compile(
+        partial(flex_attention, kernel_options={"BACKEND": "FLASH"}),
+        dynamic=False,
+    )
+    print("Using FlexAttention with FA4 backend (Blackwell)")
+else:
+    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+    print(f"Using FA3 from {repo}")
+
+if USE_FLEX_ATTENTION:
+    def _causal_mask(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    def _sliding_window_mask(window_size):
+        def mask_fn(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) & (q_idx - kv_idx < window_size)
+        return mask_fn
+
+    def _build_flex_block_mask(window_size_tuple, B, n_head, T):
+        window = window_size_tuple[0]
+        if window <= 0 or window >= T:
+            mask_fn = _causal_mask
+        else:
+            mask_fn = _sliding_window_mask(window)
+        return create_block_mask(mask_fn, B=B, H=n_head, Q_LEN=T, KV_LEN=T, device="cuda")
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -67,18 +107,23 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        # Fused QKV: single GEMM (d → 3d) instead of three separate (d → d) GEMMs
+        # torch.compile does NOT auto-fuse separate Linears with different weight tensors
+        self.q_dim = self.n_head * self.head_dim
+        self.k_dim = self.n_kv_head * self.head_dim
+        self.v_dim = self.n_kv_head * self.head_dim
+        self.c_qkv = nn.Linear(self.n_embd, self.q_dim + self.k_dim + self.v_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, block_mask=None):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        qkv = self.c_qkv(x)
+        q, k, v = qkv.split([self.q_dim, self.k_dim, self.v_dim], dim=-1)
+        q = q.view(B, T, self.n_head, self.head_dim)
+        k = k.view(B, T, self.n_kv_head, self.head_dim)
+        v = v.view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
@@ -90,7 +135,14 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if USE_FLEX_ATTENTION:
+            # FlexAttention expects (B, H, T, D) not (B, T, H, D)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = _flex_attention_compiled(q, k, v, block_mask=block_mask, enable_gqa=True)
+            y = y.transpose(1, 2)
+        else:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -115,8 +167,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, window_size, block_mask=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -126,6 +178,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
+        self._flex_block_masks = None  # Lazily built on first forward (needs CUDA device)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
@@ -133,13 +186,15 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
+        # Value embeddings — stored as ModuleDict for parameter tracking,
+        # but accessed via _ve_list (plain list) to avoid dict lookups that cause graph breaks
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({
             str(i): nn.Embedding(config.vocab_size, kv_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
+        self._ve_list = [self.value_embeds.get(str(i)) for i in range(config.n_layer)]
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -155,9 +210,7 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_qkv.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -242,8 +295,11 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+        # Verify all params are covered (use >= to allow FP8 scale params in transformer.h)
+        grouped_count = (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+        total_count = len(list(self.parameters()))
+        assert grouped_count >= total_count, f"Param group mismatch: {grouped_count} grouped vs {total_count} total"
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -270,24 +326,50 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
+        # Block masks are built eagerly before torch.compile (no lazy init = no graph break)
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            ve = self._ve_list[i](idx) if self._ve_list[i] is not None else None
+            block_mask = self._flex_block_masks[i] if USE_FLEX_ATTENTION else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], block_mask)
         x = norm(x)
 
         softcap = 15
+
+        if targets is not None:
+            # Chunked cross-entropy: avoid materializing full (B*T, V) logit tensor
+            # Saves ~8 GB of FP32 memory traffic per micro-step at B=128, T=2048, V=8192
+            x_flat = x.view(-1, x.size(-1))       # (B*T, d)
+            targets_flat = targets.view(-1)         # (B*T,)
+            chunk_size = 4096  # tokens per chunk — keeps peak logit buffer at ~134 MB
+
+            if reduction == 'none':
+                # Eval path: evaluate_bpb() needs per-token losses
+                losses = []
+                for i in range(0, x_flat.size(0), chunk_size):
+                    logits_chunk = self.lm_head(x_flat[i:i+chunk_size]).float()
+                    logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                    losses.append(F.cross_entropy(logits_chunk, targets_flat[i:i+chunk_size],
+                                                  ignore_index=-1, reduction='none'))
+                return torch.cat(losses)
+            else:
+                # Training path: accumulate sum, divide at the end
+                total_loss = torch.tensor(0.0, device=x.device)
+                n_tokens = targets_flat.ne(-1).sum()
+                for i in range(0, x_flat.size(0), chunk_size):
+                    logits_chunk = self.lm_head(x_flat[i:i+chunk_size]).float()
+                    logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                    total_loss = total_loss + F.cross_entropy(
+                        logits_chunk, targets_flat[i:i+chunk_size],
+                        ignore_index=-1, reduction='sum')
+                return total_loss / n_tokens
+
         logits = self.lm_head(x)
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
-
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
         return logits
 
 # ---------------------------------------------------------------------------
@@ -429,8 +511,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+# Model architecture — sized to cross B200 roofline (AI > 562 FLOP/byte)
+ASPECT_RATIO = 96       # model_dim = depth * ASPECT_RATIO (was 64, gives dim=1152 at depth=12)
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
@@ -446,9 +528,12 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+# Model size — scaled up for B200 (192 GB HBM3e)
+DEPTH = 12              # number of transformer layers (was 8)
+DEVICE_BATCH_SIZE = 64   # per-device batch size — est. ~83 GB at D=12/AR=96, headroom for 192 GB B200
+                         # increase to 128 if peak_vram_mb < 140,000 (target: fill ~180 GB)
+COMPILE_WARMUP_STEPS = 3 # extra warmup for max-autotune kernel benchmarking
+TIMING_WARMUP_STEPS = 10 + COMPILE_WARMUP_STEPS  # total steps before timing starts
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -460,7 +545,64 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+def get_gpu_peak_flops():
+    """Detect GPU and return peak bf16 TFLOPS (without sparsity) for MFU calculation."""
+    gpu_name = torch.cuda.get_device_name()
+    # Peak bf16 tensor core FLOPS (without sparsity) for known GPUs.
+    # More specific substrings must come before less specific ones.
+    known_gpus = [
+        # Blackwell data center
+        ("B200",           4500.0e12),
+        # Hopper data center
+        ("H200",            989.5e12),
+        ("H100 PCIe",       756.0e12),
+        ("H100 NVL",        835.0e12),
+        ("H100",            989.5e12),
+        # Ampere data center
+        ("A100",            312.0e12),
+        ("A10G",            125.0e12),
+        ("A10",             125.0e12),
+        # Ada Lovelace data center
+        ("L40S",            362.0e12),
+        ("L40",             181.0e12),
+        ("L4",              121.0e12),
+        # Volta
+        ("V100",            125.0e12),
+        # RTX 50 series (Blackwell)
+        ("RTX 5090",        419.0e12),
+        ("RTX 5080",        225.0e12),
+        ("5070 Ti",         176.0e12),
+        ("RTX 5070",        124.0e12),
+        # RTX 40 series (Ada Lovelace)
+        ("RTX 4090",        330.3e12),
+        ("4080 SUPER",      209.0e12),
+        ("RTX 4080",        195.0e12),
+        ("4070 Ti SUPER",   176.0e12),
+        ("4070 Ti",         160.0e12),
+        ("4070 SUPER",      142.0e12),
+        ("RTX 4070",        117.0e12),
+        # RTX 30 series (Ampere)
+        ("3090 Ti",         160.0e12),
+        ("RTX 3090",        142.0e12),
+        ("3080 Ti",         136.0e12),
+        ("RTX 3080",        119.0e12),
+    ]
+    for pattern, flops in known_gpus:
+        if pattern in gpu_name:
+            print(f"GPU: {gpu_name} ({flops/1e12:.1f} TFLOPS bf16 peak)")
+            return flops
+    # Fallback: rough estimate from compute capability and SM count
+    props = torch.cuda.get_device_properties(0)
+    num_sms = props.multi_processor_count
+    cap = torch.cuda.get_device_capability()
+    tflops_per_sm = {7: 1.6, 8: 2.2, 9: 7.5, 10: 17.6}.get(cap[0], 2.5)
+    estimated_flops = num_sms * tflops_per_sm * 1e12
+    print(f"WARNING: Unknown GPU '{gpu_name}' (CC {cap[0]}.{cap[1]}, {num_sms} SMs)")
+    print(f"  Estimated {estimated_flops/1e12:.1f} TFLOPS bf16 peak — MFU% will be approximate.")
+    print(f"  Add your GPU to get_gpu_peak_flops() for accurate MFU reporting.")
+    return estimated_flops
+
+GPU_PEAK_FLOPS = get_gpu_peak_flops()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -496,6 +638,37 @@ tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
+# FP8 training: 2.2x throughput on B200 (10,000 TFLOPS FP8 vs 4,500 BF16)
+# Only for Blackwell (SM100+) where FP8 tensor cores are mature
+USE_FP8 = cap[0] >= 10 and config.n_embd >= 1024  # skip for tiny models (FP8 scaling overhead)
+if USE_FP8:
+    # Try MXFP8 first (per-block-of-32 scaling, better precision than per-tensor FP8)
+    _using_mxfp8 = False
+    try:
+        from torchao.prototype.mx_formats.mx_linear import MXLinearConverter
+        mx_converter = MXLinearConverter("mxfp8_cublas")
+        # Skip ve_gate layers (32-wide, too narrow for FP8 benefit)
+        def _mx_filter(mod, fqn):
+            return isinstance(mod, nn.Linear) and "ve_gate" not in fqn
+        mx_converter.convert(model, module_filter_fn=_mx_filter)
+        _using_mxfp8 = True
+        GPU_PEAK_FLOPS = GPU_PEAK_FLOPS * 2.22  # 10000/4500 ≈ 2.22
+        print(f"MXFP8 training enabled (per-block-of-32 scaling, peak {GPU_PEAK_FLOPS/1e12:.0f} TFLOPS)")
+    except (ImportError, Exception) as e:
+        # Fall back to standard per-tensor FP8
+        print(f"MXFP8 unavailable ({e}), falling back to standard FP8")
+        from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+        fp8_config = Float8LinearConfig(pad_inner_dim=True)
+        def _fp8_module_filter(mod, fqn):
+            return isinstance(mod, nn.Linear) and "ve_gate" not in fqn
+        convert_to_float8_training(model, config=fp8_config, module_filter_fn=_fp8_module_filter)
+        GPU_PEAK_FLOPS = GPU_PEAK_FLOPS * 2.22  # 10000/4500 ≈ 2.22
+        print(f"FP8 training enabled (per-tensor scaling, peak {GPU_PEAK_FLOPS/1e12:.0f} TFLOPS)")
+else:
+    print(f"FP8 disabled (cap={cap}, n_embd={config.n_embd})")
+
+# Optimizer setup AFTER FP8 conversion — FP8 replaces nn.Linear with Float8Linear,
+# creating new parameter objects. Optimizer must reference the final parameters.
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
     embedding_lr=EMBEDDING_LR,
@@ -505,7 +678,14 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+# Eagerly build FlexAttention block masks before compile (eliminates graph break in forward)
+if USE_FLEX_ATTENTION:
+    unique_windows = set(model.window_sizes)
+    mask_cache = {ws: _build_flex_block_mask(ws, DEVICE_BATCH_SIZE, config.n_head, MAX_SEQ_LEN)
+                  for ws in unique_windows}
+    model._flex_block_masks = [mask_cache[ws] for ws in model.window_sizes]
+
+model = torch.compile(model, dynamic=False, mode="max-autotune", fullgraph=True)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -575,7 +755,7 @@ while True:
     t1 = time.time()
     dt = t1 - t0
 
-    if step > 10:
+    if step > TIMING_WARMUP_STEPS:
         total_training_time += dt
 
     # Logging
@@ -584,7 +764,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / GPU_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -600,7 +780,7 @@ while True:
     step += 1
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > TIMING_WARMUP_STEPS and total_training_time >= TIME_BUDGET:
         break
 
 print()  # newline after \r training log
@@ -615,7 +795,7 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - TIMING_WARMUP_STEPS) / total_training_time / GPU_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
