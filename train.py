@@ -26,6 +26,8 @@ inductor_config.max_autotune_gemm_backends = "CUTLASS,Triton,ATen"  # include CU
 inductor_config.epilogue_fusion = True                 # fuse pointwise ops into matmul epilogues
 inductor_config.aggressive_fusion = True               # fuse more ops into fewer kernels
 inductor_config.shape_padding = True                   # pad matrices to tensor core tile boundaries
+inductor_config.max_autotune_pointwise = True          # explicit pointwise autotuning (implicit in max-autotune, explicit for safety)
+torch._dynamo.config.compiled_autograd = True          # compile backward pass too — eliminates autograd dispatch overhead
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -151,12 +153,15 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.hidden_dim = int((8 / 3) * config.n_embd)  # 3072 at d=1152, iso-parameter with 4d ReLU²
+        # Fused gate+up projection (like fused QKV — one GEMM instead of two)
+        self.c_gate_up = nn.Linear(config.n_embd, 2 * self.hidden_dim, bias=False)
+        self.c_proj = nn.Linear(self.hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        gate_up = self.c_gate_up(x)
+        gate, up = gate_up.split([self.hidden_dim, self.hidden_dim], dim=-1)
+        x = F.silu(gate) * up
         x = self.c_proj(x)
         return x
 
@@ -200,6 +205,8 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        # Pre-allocated loss accumulator (avoids tensor allocation inside compiled forward)
+        self.register_buffer("_loss_buf", torch.zeros(1), persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -212,7 +219,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_qkv.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_gate_up.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -357,7 +364,7 @@ class GPT(nn.Module):
                 return torch.cat(losses)
             else:
                 # Training path: accumulate sum, divide at the end
-                total_loss = torch.tensor(0.0, device=x.device)
+                total_loss = self._loss_buf.zero_()
                 n_tokens = targets_flat.ne(-1).sum()
                 for i in range(0, x_flat.size(0), chunk_size):
                     logits_chunk = self.lm_head(x_flat[i:i+chunk_size]).float()
@@ -514,6 +521,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture — sized to cross B200 roofline (AI > 562 FLOP/byte)
 ASPECT_RATIO = 96       # model_dim = depth * ASPECT_RATIO (was 64, gives dim=1152 at depth=12)
 HEAD_DIM = 128          # target head dimension for attention
+GQA_RATIO = 3           # grouped query attention: 3 query heads per KV head (saves ~59M params)
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
@@ -614,7 +622,7 @@ def build_model_config(depth):
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=max(1, num_heads // GQA_RATIO), n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 
@@ -720,10 +728,12 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
 
 while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
+    torch.compiler.cudagraph_mark_step_begin()  # signal new iteration to CUDA graph trees
+    start_event.record()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
@@ -752,9 +762,9 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+    end_event.record()
+    end_event.synchronize()  # single sync (replaces both torch.cuda.synchronize calls)
+    dt = start_event.elapsed_time(end_event) / 1000  # ms → seconds
 
     if step > TIMING_WARMUP_STEPS:
         total_training_time += dt
