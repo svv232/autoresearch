@@ -114,11 +114,13 @@ def _experiment_hash(description: str) -> str:
 
 
 def detect_vram_gb() -> Optional[float]:
-    """Detect total VRAM of the current CUDA device in GB. Returns None if unavailable."""
+    """Detect a usable GPU memory limit in GB. Returns None if unavailable."""
     try:
         import torch
         if torch.cuda.is_available():
             return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if torch.backends.mps.is_available() and hasattr(torch.mps, "recommended_max_memory"):
+            return torch.mps.recommended_max_memory() / (1024 ** 3)
     except Exception:
         pass
     return None
